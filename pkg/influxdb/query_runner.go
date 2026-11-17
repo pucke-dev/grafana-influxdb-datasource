@@ -3,6 +3,7 @@ package influxdb
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"github.com/grafana/dskit/concurrency"
@@ -63,14 +64,14 @@ type queryExecutor interface {
 }
 
 // newQueryExecutor builds the executor for the datasource's query language.
-func newQueryExecutor(ctx context.Context, dsInfo *models.DatasourceInfo) (queryExecutor, error) {
+func newQueryExecutor(ctx context.Context, dsInfo *models.DatasourceInfo, headers http.Header) (queryExecutor, error) {
 	switch dsInfo.Version {
 	case influxVersionFlux:
 		return flux.NewExecutor(dsInfo)
 	case influxVersionInfluxQL:
 		return influxql.NewExecutor(ctx, tracing.DefaultTracer(), dsInfo)
 	case influxVersionSQL:
-		return fsql.NewExecutor(dsInfo)
+		return fsql.NewExecutor(dsInfo, headers)
 	default:
 		return nil, fmt.Errorf("unknown influxdb version")
 	}
@@ -78,7 +79,7 @@ func newQueryExecutor(ctx context.Context, dsInfo *models.DatasourceInfo) (query
 
 // executeRequest is the single execution path for QueryData and the health checks.
 func executeRequest(ctx context.Context, dsInfo *models.DatasourceInfo, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
-	executor, err := newQueryExecutor(ctx, dsInfo)
+	executor, err := newQueryExecutor(ctx, dsInfo, req.GetHTTPHeaders())
 	if err != nil {
 		return nil, err
 	}

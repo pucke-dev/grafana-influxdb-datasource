@@ -33,7 +33,7 @@ type Executor struct {
 }
 
 // NewExecutor validates the configuration and dials the Flight SQL client for one request.
-func NewExecutor(dsInfo *models.DatasourceInfo) (*Executor, error) {
+func NewExecutor(dsInfo *models.DatasourceInfo, forwarded http.Header) (*Executor, error) {
 	if dsInfo.URL == "" {
 		return nil, fmt.Errorf("missing URL from datasource configuration")
 	}
@@ -43,13 +43,7 @@ func NewExecutor(dsInfo *models.DatasourceInfo) (*Executor, error) {
 		return nil, err
 	}
 
-	md := metadata.MD{}
-	if dsInfo.DbName != "" {
-		md.Set("database", dsInfo.DbName)
-	}
-	if dsInfo.Token != "" {
-		md.Set("Authorization", fmt.Sprintf("Bearer %s", dsInfo.Token))
-	}
+	md := buildMetadata(dsInfo, forwarded)
 
 	fsqlClient, err := newFlightSQLClient(u, md, !dsInfo.InsecureGrpc, dsInfo.TLSConfig, dsInfo.ProxyClient)
 	if err != nil {

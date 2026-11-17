@@ -120,6 +120,7 @@ func CheckSQLHealth(ctx context.Context, dsInfo *models.DatasourceInfo, req *bac
 				},
 			},
 		},
+		Headers: req.Headers,
 	})
 
 	if err != nil {

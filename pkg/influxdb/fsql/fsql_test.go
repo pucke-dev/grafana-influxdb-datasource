@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -18,21 +19,66 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/proxy"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/grafana/grafana-influxdb-datasource/pkg/influxdb/models"
 )
 
 type FSQLTestSuite struct {
 	suite.Suite
-	db     *sql.DB
-	server flight.Server
-	addr   string
+	db       *sql.DB
+	server   flight.Server
+	addr     string
+	recorder *mdRecorder
+}
+
+const (
+	getFlightInfoMethod = "/arrow.flight.protocol.FlightService/GetFlightInfo"
+	doGetMethod         = "/arrow.flight.protocol.FlightService/DoGet"
+)
+
+// mdRecorder stores the last incoming metadata per gRPC method.
+type mdRecorder struct {
+	mu    sync.Mutex
+	calls map[string]metadata.MD
+}
+
+func newMDRecorder() *mdRecorder {
+	return &mdRecorder{calls: map[string]metadata.MD{}}
+}
+
+func (r *mdRecorder) record(ctx context.Context, method string) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls[method] = md.Copy()
+}
+
+func (r *mdRecorder) get(method string) metadata.MD {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[method]
+}
+
+func (r *mdRecorder) middleware() flight.ServerMiddleware {
+	return flight.ServerMiddleware{
+		Unary: func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			r.record(ctx, info.FullMethod)
+			return handler(ctx, req)
+		},
+		Stream: func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			r.record(ss.Context(), info.FullMethod)
+			return handler(srv, ss)
+		},
+	}
 }
 
 func (suite *FSQLTestSuite) SetupTest() {
 	addr, _ := freeport(suite.T())
 
 	suite.addr = addr
+	suite.recorder = newMDRecorder()
 
 	db, err := example.CreateDB()
 	require.NoError(suite.T(), err)
@@ -40,7 +86,7 @@ func (suite *FSQLTestSuite) SetupTest() {
 	sqliteServer, err := example.NewSQLiteFlightSQLServer(db)
 	require.NoError(suite.T(), err)
 	sqliteServer.Alloc = memory.NewCheckedAllocator(memory.DefaultAllocator)
-	server := flight.NewServerWithMiddleware(nil)
+	server := flight.NewServerWithMiddleware([]flight.ServerMiddleware{suite.recorder.middleware()})
 	server.RegisterFlightService(flightsql.NewFlightServer(sqliteServer))
 	err = server.Init(suite.addr)
 	require.NoError(suite.T(), err)
@@ -71,15 +117,16 @@ func TestIntegrationFSQLTestSuite(t *testing.T) {
 
 func (suite *FSQLTestSuite) newExecutor() *Executor {
 	executor, err := NewExecutor(&models.DatasourceInfo{
-		HTTPClient:   nil,
-		Token:        "secret",
-		URL:          "http://" + suite.addr,
-		DbName:       "influxdb",
-		Version:      "test",
-		HTTPMode:     "proxy",
-		InsecureGrpc: true,
-		ProxyClient:  proxy.New(nil),
-	})
+		HTTPClient:    nil,
+		Token:         "secret",
+		URL:           "http://" + suite.addr,
+		DbName:        "influxdb",
+		Version:       "test",
+		HTTPMode:      "proxy",
+		InsecureGrpc:  true,
+		ProxyClient:   proxy.New(nil),
+		CustomHeaders: http.Header{},
+	}, http.Header{})
 	require.NoError(suite.T(), err)
 	return executor
 }
@@ -109,6 +156,56 @@ func (suite *FSQLTestSuite) TestIntegration_QueryData() {
 		for _, f := range frame.Fields {
 			require.Equal(suite.T(), 4, f.Len())
 		}
+	})
+}
+
+func (suite *FSQLTestSuite) TestIntegration_SendsMetadata() {
+	run := func(customHeaders, forwarded http.Header) {
+		executor, err := NewExecutor(&models.DatasourceInfo{
+			Token:         "secret",
+			URL:           "http://" + suite.addr,
+			DbName:        "influxdb",
+			InsecureGrpc:  true,
+			ProxyClient:   proxy.New(nil),
+			CustomHeaders: customHeaders,
+		}, forwarded)
+		require.NoError(suite.T(), err)
+		defer func() { require.NoError(suite.T(), executor.Close()) }()
+
+		resp := executor.Execute(context.Background(), backend.DataQuery{
+			RefID: "A",
+			JSON:  mustQueryJSON(suite.T(), "A", "select 1"),
+		})
+		require.NoError(suite.T(), resp.Error)
+	}
+
+	assertMD := func(key, want string) {
+		for _, method := range []string{getFlightInfoMethod, doGetMethod} {
+			md := suite.recorder.get(method)
+			require.NotNil(suite.T(), md, "no call recorded for %s", method)
+			require.Equal(suite.T(), []string{want}, md.Get(key), "%s on %s", key, method)
+		}
+	}
+
+	suite.Run("token and database", func() {
+		run(nil, nil)
+		assertMD("authorization", "Bearer secret")
+		assertMD("database", "influxdb")
+	})
+
+	suite.Run("custom headers", func() {
+		run(http.Header{"X-Org": {"grafana"}, "Authorization": {"Token custom"}}, nil)
+		assertMD("x-org", "grafana")
+		assertMD("authorization", "Token custom")
+	})
+
+	suite.Run("forwarded oauth identity", func() {
+		forwarded := http.Header{}
+		forwarded.Set(backend.OAuthIdentityTokenHeaderName, "Bearer user-token")
+		forwarded.Set(backend.OAuthIdentityIDTokenHeaderName, "user-id-token")
+		run(http.Header{"Authorization": {"Token custom"}}, forwarded)
+		assertMD("authorization", "Bearer user-token")
+		assertMD("x-id-token", "user-id-token")
 	})
 }
 
@@ -182,15 +279,16 @@ func freeport(t *testing.T) (addr string, err error) {
 
 func TestInvalidSchema(t *testing.T) {
 	executor, err := NewExecutor(&models.DatasourceInfo{
-		HTTPClient:   nil,
-		Token:        "secret",
-		URL:          "http://127.0.0.1:1234",
-		DbName:       "influxdb",
-		Version:      "test",
-		HTTPMode:     "proxy",
-		InsecureGrpc: true,
-		ProxyClient:  proxy.New(nil),
-	})
+		HTTPClient:    nil,
+		Token:         "secret",
+		URL:           "http://127.0.0.1:1234",
+		DbName:        "influxdb",
+		Version:       "test",
+		HTTPMode:      "proxy",
+		InsecureGrpc:  true,
+		ProxyClient:   proxy.New(nil),
+		CustomHeaders: http.Header{},
+	}, http.Header{})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, executor.Close()) }()
 

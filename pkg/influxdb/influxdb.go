@@ -84,6 +84,7 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 			Timeout:       opts.Timeouts.Timeout,
 			ProxyClient:   proxyClient,
 			TLSConfig:     opts.TLS,
+			CustomHeaders: opts.Header.Clone(),
 		},
 	}, nil
 }

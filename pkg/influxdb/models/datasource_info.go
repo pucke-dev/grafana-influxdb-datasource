@@ -29,4 +29,9 @@ type DatasourceInfo struct {
 	TLSConfig *httpclient.TLSOptions
 
 	ProxyClient proxy.Client
+
+	// CustomHeaders are the custom HTTP headers configured on the datasource
+	// (httpHeaderName/httpHeaderValue). Only the Flight SQL path reads this;
+	// the HTTP paths get them through HTTPClient's middleware.
+	CustomHeaders http.Header
 }
